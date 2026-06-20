@@ -8,7 +8,7 @@ from insightface.app import FaceAnalysis
 from insightface.model_zoo import model_zoo
 import cv2
 import numpy as np
-from moviepy.editor import VideoFileClip, ImageSequenceClip
+from moviepy import VideoFileClip, ImageSequenceClip
 from moviepy.video.io.ffmpeg_tools import ffmpeg_extract_subclip
 
 # Enable logging
@@ -18,7 +18,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Bot token from the user
-BOT_TOKEN = "8955338935:AAGpPmF7HLOZCtiCUD-ZP96UpYPeTEl5czA"
+BOT_TOKEN = "8955338935:AAGpPmF7HLOZCtiCUD-ZP96UpYPeTEt5cz0"
 
 # Model paths
 MODEL_DIR = "/home/ubuntu/SwipyBot/models"
@@ -28,7 +28,7 @@ INSWAFFER_MODEL_PATH = os.path.join(MODEL_DIR, "inswapper_128.onnx")
 app = FaceAnalysis(name="buffalo_l", root=MODEL_DIR)
 app.prepare(ctx_id=0, det_size=(640, 640))
 
-swapper = model_zoo.get_model(INSWAFFER_MODEL_PATH, providers=app.providers)
+swapper = model_zoo.get_model(INSWAFFER_MODEL_PATH)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a message when the command /start is issued."""
