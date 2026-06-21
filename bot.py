@@ -165,7 +165,9 @@ async def process_video_swap(source_face, target_video_path: str) -> str | None:
 
 def main() -> None:
     """Start the bot."""
-    application = Application.builder().token(BOT_TOKEN).build()
+    from telegram.request import HTTPXRequest
+    request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
+    application = Application.builder().token(BOT_TOKEN).request(request).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("swipFace", swip_face_command))
