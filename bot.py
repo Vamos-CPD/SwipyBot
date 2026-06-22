@@ -9,6 +9,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 from insightface.app import FaceAnalysis
 from insightface.model_zoo import model_zoo
 import subprocess
+from decord import VideoReader, cpu
 
 # Enable logging
 logging.basicConfig(
@@ -29,10 +30,15 @@ app.prepare(ctx_id=-1, det_size=(640, 640)) # Use CPU (ctx_id=-1)
 
 swapper = model_zoo.get_model(INSWAFFER_MODEL_PATH, download=False, download_zip=False)
 
+# Define conversation states
+SELECTING_SOURCE_IMAGE = 0
+SELECTING_TARGET_MEDIA = 1
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a message when the command /start is issued."""
     user = update.effective_user
     context.user_data.clear() # Clear previous state
+    context.user_data["status"] = SELECTING_SOURCE_IMAGE
     await update.message.reply_html(
         f"Hi {user.mention_html()}!\nI am a FaceSwap bot. "
         "Please send me an **image** to use as the **source face**."
@@ -42,9 +48,9 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """Handle incoming media (photos and videos) for face swapping."""
     user_data = context.user_data
     chat_id = update.effective_chat.id
+    current_status = user_data.get("status", SELECTING_SOURCE_IMAGE)
 
-    if "source_face" not in user_data:
-        # State 1: Waiting for source face
+    if current_status == SELECTING_SOURCE_IMAGE:
         if update.message.photo:
             file_id = update.message.photo[-1].file_id
             file = await context.bot.get_file(file_id)
@@ -52,64 +58,65 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await update.message.reply_text("Downloading source image...")
             await file.download_to_drive(source_path)
             user_data["source_face"] = source_path
+            user_data["status"] = SELECTING_TARGET_MEDIA
             await update.message.reply_text("Source face received. Now send the **target image or video** to swap the face onto.")
         else:
             await update.message.reply_text("Please send an **image** for the source face.")
         return
 
-    # State 2: Source face received, waiting for target media
-    source_face_path = user_data["source_face"]
-    source_face_img = cv2.imread(source_face_path)
-    source_faces = app.get(source_face_img)
+    elif current_status == SELECTING_TARGET_MEDIA:
+        source_face_path = user_data["source_face"]
+        source_face_img = cv2.imread(source_face_path)
+        source_faces = app.get(source_face_img)
 
-    if not source_faces:
-        await update.message.reply_text("Could not detect a face in the source image. Please try again with a clearer image.")
+        if not source_faces:
+            await update.message.reply_text("Could not detect a face in the source image. Please try again with a clearer image.")
+            if os.path.exists(source_face_path):
+                os.remove(source_face_path)
+            user_data.clear()
+            user_data["status"] = SELECTING_SOURCE_IMAGE
+            return
+        
+        source_face = source_faces[0]
+
+        if update.message.photo:
+            file_id = update.message.photo[-1].file_id
+            file = await context.bot.get_file(file_id)
+            target_path = f"/tmp/{file_id}.jpg"
+            await update.message.reply_text("Downloading target image...")
+            await file.download_to_drive(target_path)
+            await update.message.reply_text("Processing image face swap...")
+            output_path = await process_image_swap(source_face, target_path)
+            if output_path and os.path.exists(output_path):
+                await update.message.reply_document(document=output_path)
+                os.remove(output_path)
+            else:
+                await update.message.reply_text("Failed to process image face swap.")
+            if os.path.exists(target_path):
+                os.remove(target_path)
+
+        elif update.message.video:
+            file_id = update.message.video.file_id
+            file = await context.bot.get_file(file_id)
+            target_path = f"/tmp/{file_id}.mp4"
+            await update.message.reply_text("Downloading target video...")
+            await file.download_to_drive(target_path)
+            progress_message = await update.message.reply_text("Processing video face swap... 0% complete.")
+            
+            # Offload heavy processing to an asyncio task
+            asyncio.create_task(process_video_swap_and_reply(
+                source_face, target_path, progress_message, context.bot, chat_id, user_data
+            ))
+            user_data["status"] = SELECTING_SOURCE_IMAGE # Reset state while processing
+            return # Exit to allow async task to run
+        else:
+            await update.message.reply_text("Please send a valid **image or video** for the target.")
+        
+        # Clean up source face and reset state after sync processing
         if os.path.exists(source_face_path):
             os.remove(source_face_path)
-        del user_data["source_face"]
-        return
-    
-    source_face = source_faces[0]
-
-    if update.message.photo:
-        file_id = update.message.photo[-1].file_id
-        file = await context.bot.get_file(file_id)
-        target_path = f"/tmp/{file_id}.jpg"
-        await update.message.reply_text("Downloading target image...")
-        await file.download_to_drive(target_path)
-        await update.message.reply_text("Processing image face swap...")
-        output_path = await process_image_swap(source_face, target_path)
-        if output_path and os.path.exists(output_path):
-            await update.message.reply_document(document=output_path)
-            os.remove(output_path)
-        else:
-            await update.message.reply_text("Failed to process image face swap.")
-        if os.path.exists(target_path):
-            os.remove(target_path)
-
-    elif update.message.video:
-        file_id = update.message.video.file_id
-        file = await context.bot.get_file(file_id)
-        target_path = f"/tmp/{file_id}.mp4"
-        await update.message.reply_text("Downloading target video...")
-        await file.download_to_drive(target_path)
-        progress_message = await update.message.reply_text("Processing video face swap... 0% complete.")
-        output_path = await process_video_swap(source_face, target_path, progress_message, context.bot, chat_id)
-        if output_path and os.path.exists(output_path):
-            await context.bot.edit_message_text(chat_id=chat_id, message_id=progress_message.message_id, text="Video face swap complete! Sending result...")
-            await update.message.reply_video(video=output_path)
-            os.remove(output_path)
-        else:
-            await context.bot.edit_message_text(chat_id=chat_id, message_id=progress_message.message_id, text="Failed to process video face swap.")
-        if os.path.exists(target_path):
-            os.remove(target_path)
-    else:
-        await update.message.reply_text("Please send a valid **image or video** for the target.")
-    
-    # Clean up source face
-    if os.path.exists(source_face_path):
-        os.remove(source_face_path)
-    del user_data["source_face"]
+        user_data.clear()
+        user_data["status"] = SELECTING_SOURCE_IMAGE
 
 async def process_image_swap(source_face, target_image_path: str) -> str | None:
     """Performs face swap on an image."""
@@ -128,68 +135,80 @@ async def process_image_swap(source_face, target_image_path: str) -> str | None:
     cv2.imwrite(output_path, result_img)
     return output_path
 
-async def process_video_swap(source_face, target_video_path: str, progress_message, bot, chat_id) -> str | None:
-    """Performs face swap on a video using a more memory-efficient frame-by-frame approach."""
+async def process_video_swap_and_reply(source_face, target_video_path: str, progress_message, bot, chat_id, user_data) -> None:
+    """Performs face swap on a video and replies to the user."""
+    output_path = None
+    try:
+        output_path = await _process_video_swap(source_face, target_video_path, progress_message, bot, chat_id)
+        if output_path and os.path.exists(output_path):
+            await bot.edit_message_text(chat_id=chat_id, message_id=progress_message.message_id, text="Video face swap complete! Sending result...")
+            await bot.send_video(chat_id=chat_id, video=output_path)
+            os.remove(output_path)
+        else:
+            await bot.edit_message_text(chat_id=chat_id, message_id=progress_message.message_id, text="Failed to process video face swap.")
+    except Exception as e:
+        logger.error(f"Error in process_video_swap_and_reply: {e}")
+        await bot.edit_message_text(chat_id=chat_id, message_id=progress_message.message_id, text="An unexpected error occurred during video processing.")
+    finally:
+        if os.path.exists(target_video_path):
+            os.remove(target_video_path)
+        if "source_face" in user_data and os.path.exists(user_data["source_face"]):
+            os.remove(user_data["source_face"])
+        user_data.clear()
+        user_data["status"] = SELECTING_SOURCE_IMAGE
+
+async def _process_video_swap(source_face, target_video_path: str, progress_message, bot, chat_id) -> str | None:
+    """Internal function to perform face swap on a video."""
     output_path = target_video_path.replace(".mp4", "_swapped.mp4")
     temp_video_no_audio = target_video_path.replace(".mp4", "_temp_no_audio.mp4")
     
-    cap = cv2.VideoCapture(target_video_path)
-    if not cap.isOpened():
-        logger.error(f"Could not open target video: {target_video_path}")
-        return None
-    
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-    if total_frames <= 0:
-        logger.warning(f"Could not determine total frames for {target_video_path}. Progress updates will be limited.")
-        total_frames = -1 # Indicate unknown total frames
-
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v') # Use mp4v codec for broader compatibility
-    out = cv2.VideoWriter(temp_video_no_audio, fourcc, fps, (width, height))
-    
-    if not out.isOpened():
-        logger.error(f"Could not open video writer for {temp_video_no_audio}")
-        cap.release()
-        return None
-
-    last_reported_percent = -1
     try:
-        frame_count = 0
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                break
+        vr = VideoReader(target_video_path, ctx=cpu(0)) # Use Decord for efficient video reading
+        fps = vr.get_avg_fps()
+        width = vr.width
+        height = vr.height
+        total_frames = len(vr)
+
+        if total_frames <= 0:
+            logger.warning(f"Could not determine total frames for {target_video_path}. Progress updates will be limited.")
+            total_frames = -1 # Indicate unknown total frames
+
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v') # Use mp4v codec for broader compatibility
+        out = cv2.VideoWriter(temp_video_no_audio, fourcc, fps, (width, height))
+        
+        if not out.isOpened():
+            logger.error(f"Could not open video writer for {temp_video_no_audio}")
+            return None
+
+        last_reported_percent = -1
+        for frame_idx in range(total_frames):
+            frame = vr[frame_idx].asnumpy() # Get frame as numpy array
+            frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
             
-            target_faces = app.get(frame)
+            target_faces = app.get(frame_bgr)
             if target_faces:
-                # Sort faces by size (area) to swap the largest one
                 target_faces = sorted(target_faces, key=lambda x: (x.bbox[2]-x.bbox[0])*(x.bbox[3]-x.bbox[1]), reverse=True)
-                frame = swapper.get(frame, target_faces[0], source_face, paste_back=True)
+                frame_bgr = swapper.get(frame_bgr, target_faces[0], source_face, paste_back=True)
             
-            out.write(frame)
-            frame_count += 1
+            out.write(frame_bgr)
 
             if total_frames > 0:
-                current_percent = int((frame_count / total_frames) * 100)
+                current_percent = int(((frame_idx + 1) / total_frames) * 100)
                 if current_percent > last_reported_percent + 5 or current_percent == 100: # Update every 5% or at 100%
                     await bot.edit_message_text(chat_id=chat_id, message_id=progress_message.message_id, text=f"Processing video face swap... {current_percent}% complete.")
                     last_reported_percent = current_percent
-            elif frame_count % 100 == 0: # Fallback for unknown total frames
-                await bot.edit_message_text(chat_id=chat_id, message_id=progress_message.message_id, text=f"Processing video face swap... Processed {frame_count} frames.")
+            elif (frame_idx + 1) % 100 == 0: # Fallback for unknown total frames
+                await bot.edit_message_text(chat_id=chat_id, message_id=progress_message.message_id, text=f"Processing video face swap... Processed {frame_idx + 1} frames.")
 
     except Exception as e:
-        logger.error(f"Error during frame processing: {e}")
+        logger.error(f"Error during frame processing with Decord: {e}")
         return None
     finally:
-        cap.release()
-        out.release()
+        if 'out' in locals() and out.isOpened():
+            out.release()
     
     # Use FFmpeg to merge original audio with swapped video
     try:
-        # Check if the original video has an audio track
         result = subprocess.run(
             ['ffprobe', '-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', target_video_path],
             capture_output=True, text=True, check=True
@@ -209,7 +228,6 @@ async def process_video_swap(source_face, target_video_path: str, progress_messa
 
     except subprocess.CalledProcessError as e:
         logger.error(f"FFmpeg or FFprobe error: {e.stderr}")
-        # If FFmpeg fails, just rename the video without audio
         os.rename(temp_video_no_audio, output_path)
     except Exception as e:
         logger.error(f"Error during FFmpeg audio merge: {e}")
