@@ -2,14 +2,13 @@
 import logging
 import os
 import asyncio
-from telegram import Update, Bot
+import cv2
+import numpy as np
+from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from insightface.app import FaceAnalysis
 from insightface.model_zoo import model_zoo
-import cv2
-import numpy as np
-from moviepy import VideoFileClip, ImageSequenceClip
-from moviepy.video.io.ffmpeg_tools import ffmpeg_extract_subclip
+import subprocess
 
 # Enable logging
 logging.basicConfig(
@@ -26,9 +25,9 @@ INSWAFFER_MODEL_PATH = os.path.join(MODEL_DIR, "inswapper_128.onnx")
 
 # Initialize FaceAnalysis and FaceSwapper
 app = FaceAnalysis(name="buffalo_l", root=MODEL_DIR)
-app.prepare(ctx_id=0, det_size=(640, 640))
+app.prepare(ctx_id=-1, det_size=(640, 640)) # Use CPU (ctx_id=-1)
 
-swapper = model_zoo.get_model(INSWAFFER_MODEL_PATH)
+swapper = model_zoo.get_model(INSWAFFER_MODEL_PATH, download=False, download_zip=False)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a message when the command /start is issued."""
@@ -46,7 +45,6 @@ async def swip_face_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle incoming media (photos and videos) for face swapping."""
-    chat_id = update.effective_chat.id
     user_data = context.user_data
 
     if "source_face" not in user_data:
@@ -71,6 +69,8 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     if not source_faces:
         await update.message.reply_text("Could not detect a face in the source image. Please try again with a clearer image.")
+        if os.path.exists(source_face_path):
+            os.remove(source_face_path)
         del user_data["source_face"]
         return
     
@@ -83,10 +83,13 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await file.download_to_drive(target_path)
         await update.message.reply_text("Processing image face swap...")
         output_path = await process_image_swap(source_face, target_path)
-        if output_path:
+        if output_path and os.path.exists(output_path):
             await update.message.reply_document(document=output_path)
+            os.remove(output_path)
         else:
-            await update.message.reply_text("Failed to process image face swap. No faces detected in target or an error occurred.")
+            await update.message.reply_text("Failed to process image face swap.")
+        if os.path.exists(target_path):
+            os.remove(target_path)
 
     elif update.message.video:
         file_id = update.message.video.file_id
@@ -95,17 +98,20 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await file.download_to_drive(target_path)
         await update.message.reply_text("Processing video face swap... This may take a while.")
         output_path = await process_video_swap(source_face, target_path)
-        if output_path:
+        if output_path and os.path.exists(output_path):
             await update.message.reply_video(video=output_path)
+            os.remove(output_path)
         else:
-            await update.message.reply_text("Failed to process video face swap. No faces detected in target or an error occurred.")
+            await update.message.reply_text("Failed to process video face swap.")
+        if os.path.exists(target_path):
+            os.remove(target_path)
     else:
         await update.message.reply_text("Please send a valid image or video for the target.")
     
-    # Clean up user data for the next swap
-    if "source_face" in user_data:
-        os.remove(user_data["source_face"])
-        del user_data["source_face"]
+    # Clean up source face
+    if os.path.exists(source_face_path):
+        os.remove(source_face_path)
+    del user_data["source_face"]
 
 async def process_image_swap(source_face, target_image_path: str) -> str | None:
     """Performs face swap on an image."""
@@ -116,51 +122,87 @@ async def process_image_swap(source_face, target_image_path: str) -> str | None:
 
     target_faces = app.get(target_img)
     if not target_faces:
+        logger.warning(f"No faces detected in target image: {target_image_path}")
         return None
 
-    # Assuming we swap the source face onto the first detected target face
     result_img = swapper.get(target_img, target_faces[0], source_face, paste_back=True)
     output_path = target_image_path.replace(".jpg", "_swapped.jpg")
     cv2.imwrite(output_path, result_img)
     return output_path
 
 async def process_video_swap(source_face, target_video_path: str) -> str | None:
-    """Performs face swap on a video."""
+    """Performs face swap on a video using a more memory-efficient frame-by-frame approach."""
     output_path = target_video_path.replace(".mp4", "_swapped.mp4")
-    temp_audio_path = target_video_path.replace(".mp4", "_audio.mp3")
-
-    try:
-        video_clip = VideoFileClip(target_video_path)
-        video_clip.audio.write_audiofile(temp_audio_path)
-    except Exception as e:
-        logger.warning(f"Could not extract audio from video: {e}. Proceeding without audio.")
-        temp_audio_path = None
-
-    frames = []
-    for i, frame in enumerate(video_clip.iter_frames(fps=video_clip.fps)):
-        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        target_faces = app.get(frame_bgr)
-        if target_faces:
-            # Swap face on the first detected face in the frame
-            result_frame_bgr = swapper.get(frame_bgr, target_faces[0], source_face, paste_back=True)
-            result_frame_rgb = cv2.cvtColor(result_frame_bgr, cv2.COLOR_BGR2RGB)
-            frames.append(result_frame_rgb)
-        else:
-            frames.append(frame) # If no face detected, keep original frame
-
-    if not frames:
+    temp_video_no_audio = target_video_path.replace(".mp4", "_temp_no_audio.mp4")
+    
+    cap = cv2.VideoCapture(target_video_path)
+    if not cap.isOpened():
+        logger.error(f"Could not open target video: {target_video_path}")
+        return None
+    
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v') # Use mp4v codec for broader compatibility
+    out = cv2.VideoWriter(temp_video_no_audio, fourcc, fps, (width, height))
+    
+    if not out.isOpened():
+        logger.error(f"Could not open video writer for {temp_video_no_audio}")
+        cap.release()
         return None
 
-    swapped_clip = ImageSequenceClip(frames, fps=video_clip.fps)
-    if temp_audio_path and os.path.exists(temp_audio_path):
-        swapped_clip = swapped_clip.set_audio(VideoFileClip(temp_audio_path).audio)
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            target_faces = app.get(frame)
+            if target_faces:
+                # Sort faces by size (area) to swap the largest one
+                target_faces = sorted(target_faces, key=lambda x: (x.bbox[2]-x.bbox[0])*(x.bbox[3]-x.bbox[1]), reverse=True)
+                frame = swapper.get(frame, target_faces[0], source_face, paste_back=True)
+            
+            out.write(frame)
+    except Exception as e:
+        logger.error(f"Error during frame processing: {e}")
+        return None
+    finally:
+        cap.release()
+        out.release()
     
-    swapped_clip.write_videofile(output_path, codec="libx264", audio_codec="aac")
-    
-    # Clean up temporary audio file
-    if temp_audio_path and os.path.exists(temp_audio_path):
-        os.remove(temp_audio_path)
+    # Use FFmpeg to merge original audio with swapped video
+    try:
+        # Check if the original video has an audio track
+        result = subprocess.run(
+            ['ffprobe', '-v', 'error', '-select_streams', 'a', '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', target_video_path],
+            capture_output=True, text=True, check=True
+        )
+        has_audio = bool(result.stdout.strip())
 
+        if has_audio:
+            logger.info("Merging video with original audio.")
+            subprocess.run([
+                'ffmpeg', '-y', '-i', temp_video_no_audio, '-i', target_video_path,
+                '-map', '0:v', '-map', '1:a', '-c:v', 'libx264', '-c:a', 'aac',
+                '-shortest', output_path
+            ], check=True)
+        else:
+            logger.info("Original video has no audio, skipping audio merge.")
+            os.rename(temp_video_no_audio, output_path)
+
+    except subprocess.CalledProcessError as e:
+        logger.error(f"FFmpeg or FFprobe error: {e.stderr}")
+        # If FFmpeg fails, just rename the video without audio
+        os.rename(temp_video_no_audio, output_path)
+    except Exception as e:
+        logger.error(f"Error during FFmpeg audio merge: {e}")
+        os.rename(temp_video_no_audio, output_path)
+    finally:
+        if os.path.exists(temp_video_no_audio):
+            os.remove(temp_video_no_audio)
+        
     return output_path
 
 def main() -> None:
@@ -171,7 +213,7 @@ def main() -> None:
     application.add_handler(CommandHandler("swipFace", swip_face_command))
     application.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, handle_media))
 
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    application.run_polling(drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
