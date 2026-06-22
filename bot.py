@@ -165,8 +165,9 @@ async def _process_video_swap(source_face, target_video_path: str, progress_mess
     try:
         vr = VideoReader(target_video_path, ctx=cpu(0)) # Use Decord for efficient video reading
         fps = vr.get_avg_fps()
-        width = vr.width
-        height = vr.height
+        # Corrected: Use shape to get dimensions in Decord
+        frame_shape = vr[0].shape
+        height, width, _ = frame_shape
         total_frames = len(vr)
 
         if total_frames <= 0:
