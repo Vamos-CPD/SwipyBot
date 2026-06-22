@@ -49,6 +49,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             file_id = update.message.photo[-1].file_id
             file = await context.bot.get_file(file_id)
             source_path = f"/tmp/{file_id}.jpg"
+            await update.message.reply_text("Downloading source image...")
             await file.download_to_drive(source_path)
             user_data["source_face"] = source_path
             await update.message.reply_text("Source face received. Now send the **target image or video** to swap the face onto.")
@@ -92,7 +93,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         target_path = f"/tmp/{file_id}.mp4"
         await update.message.reply_text("Downloading target video...")
         await file.download_to_drive(target_path)
-        progress_message = await update.message.reply_text("Processing video face swap... This may take a while.")
+        progress_message = await update.message.reply_text("Processing video face swap... 0% complete.")
         output_path = await process_video_swap(source_face, target_path, progress_message, context.bot, chat_id)
         if output_path and os.path.exists(output_path):
             await context.bot.edit_message_text(chat_id=chat_id, message_id=progress_message.message_id, text="Video face swap complete! Sending result...")
@@ -142,6 +143,10 @@ async def process_video_swap(source_face, target_video_path: str, progress_messa
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
+    if total_frames <= 0:
+        logger.warning(f"Could not determine total frames for {target_video_path}. Progress updates will be limited.")
+        total_frames = -1 # Indicate unknown total frames
+
     fourcc = cv2.VideoWriter_fourcc(*'mp4v') # Use mp4v codec for broader compatibility
     out = cv2.VideoWriter(temp_video_no_audio, fourcc, fps, (width, height))
     
@@ -150,6 +155,7 @@ async def process_video_swap(source_face, target_video_path: str, progress_messa
         cap.release()
         return None
 
+    last_reported_percent = -1
     try:
         frame_count = 0
         while True:
@@ -165,9 +171,15 @@ async def process_video_swap(source_face, target_video_path: str, progress_messa
             
             out.write(frame)
             frame_count += 1
-            if frame_count % 50 == 0:
-                progress_percent = int((frame_count / total_frames) * 100)
-                await bot.edit_message_text(chat_id=chat_id, message_id=progress_message.message_id, text=f"Processing video face swap... {progress_percent}% complete.")
+
+            if total_frames > 0:
+                current_percent = int((frame_count / total_frames) * 100)
+                if current_percent > last_reported_percent + 5 or current_percent == 100: # Update every 5% or at 100%
+                    await bot.edit_message_text(chat_id=chat_id, message_id=progress_message.message_id, text=f"Processing video face swap... {current_percent}% complete.")
+                    last_reported_percent = current_percent
+            elif frame_count % 100 == 0: # Fallback for unknown total frames
+                await bot.edit_message_text(chat_id=chat_id, message_id=progress_message.message_id, text=f"Processing video face swap... Processed {frame_count} frames.")
+
     except Exception as e:
         logger.error(f"Error during frame processing: {e}")
         return None
