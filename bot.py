@@ -32,37 +32,31 @@ swapper = model_zoo.get_model(INSWAFFER_MODEL_PATH, download=False, download_zip
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send a message when the command /start is issued."""
     user = update.effective_user
+    context.user_data.clear() # Clear previous state
     await update.message.reply_html(
-        f"Hi {user.mention_html()}!\nI am a FaceSwap bot. Send me /swipFace to start swapping faces."
-    )
-
-async def swip_face_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Inform user to send source and target media."""
-    await update.message.reply_text(
-        "Please send me two images or a video and an image.\n"\
-        "The first media will be the source face, and the second will be the target."
+        f"Hi {user.mention_html()}!\nI am a FaceSwap bot. "
+        "Please send me an **image** to use as the **source face**."
     )
 
 async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle incoming media (photos and videos) for face swapping."""
     user_data = context.user_data
+    chat_id = update.effective_chat.id
 
     if "source_face" not in user_data:
-        # First media is the source face
+        # State 1: Waiting for source face
         if update.message.photo:
             file_id = update.message.photo[-1].file_id
             file = await context.bot.get_file(file_id)
             source_path = f"/tmp/{file_id}.jpg"
             await file.download_to_drive(source_path)
             user_data["source_face"] = source_path
-            await update.message.reply_text("Source face received. Now send the target image or video.")
-        elif update.message.video:
-            await update.message.reply_text("Videos cannot be used as source faces. Please send an image for the source face.")
+            await update.message.reply_text("Source face received. Now send the **target image or video** to swap the face onto.")
         else:
-            await update.message.reply_text("Please send an image for the source face.")
+            await update.message.reply_text("Please send an **image** for the source face.")
         return
 
-    # Second media is the target
+    # State 2: Source face received, waiting for target media
     source_face_path = user_data["source_face"]
     source_face_img = cv2.imread(source_face_path)
     source_faces = app.get(source_face_img)
@@ -80,6 +74,7 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         file_id = update.message.photo[-1].file_id
         file = await context.bot.get_file(file_id)
         target_path = f"/tmp/{file_id}.jpg"
+        await update.message.reply_text("Downloading target image...")
         await file.download_to_drive(target_path)
         await update.message.reply_text("Processing image face swap...")
         output_path = await process_image_swap(source_face, target_path)
@@ -95,18 +90,20 @@ async def handle_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         file_id = update.message.video.file_id
         file = await context.bot.get_file(file_id)
         target_path = f"/tmp/{file_id}.mp4"
+        await update.message.reply_text("Downloading target video...")
         await file.download_to_drive(target_path)
-        await update.message.reply_text("Processing video face swap... This may take a while.")
-        output_path = await process_video_swap(source_face, target_path)
+        progress_message = await update.message.reply_text("Processing video face swap... This may take a while.")
+        output_path = await process_video_swap(source_face, target_path, progress_message, context.bot, chat_id)
         if output_path and os.path.exists(output_path):
+            await context.bot.edit_message_text(chat_id=chat_id, message_id=progress_message.message_id, text="Video face swap complete! Sending result...")
             await update.message.reply_video(video=output_path)
             os.remove(output_path)
         else:
-            await update.message.reply_text("Failed to process video face swap.")
+            await context.bot.edit_message_text(chat_id=chat_id, message_id=progress_message.message_id, text="Failed to process video face swap.")
         if os.path.exists(target_path):
             os.remove(target_path)
     else:
-        await update.message.reply_text("Please send a valid image or video for the target.")
+        await update.message.reply_text("Please send a valid **image or video** for the target.")
     
     # Clean up source face
     if os.path.exists(source_face_path):
@@ -130,7 +127,7 @@ async def process_image_swap(source_face, target_image_path: str) -> str | None:
     cv2.imwrite(output_path, result_img)
     return output_path
 
-async def process_video_swap(source_face, target_video_path: str) -> str | None:
+async def process_video_swap(source_face, target_video_path: str, progress_message, bot, chat_id) -> str | None:
     """Performs face swap on a video using a more memory-efficient frame-by-frame approach."""
     output_path = target_video_path.replace(".mp4", "_swapped.mp4")
     temp_video_no_audio = target_video_path.replace(".mp4", "_temp_no_audio.mp4")
@@ -143,7 +140,8 @@ async def process_video_swap(source_face, target_video_path: str) -> str | None:
     fps = cap.get(cv2.CAP_PROP_FPS)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
     fourcc = cv2.VideoWriter_fourcc(*'mp4v') # Use mp4v codec for broader compatibility
     out = cv2.VideoWriter(temp_video_no_audio, fourcc, fps, (width, height))
     
@@ -153,6 +151,7 @@ async def process_video_swap(source_face, target_video_path: str) -> str | None:
         return None
 
     try:
+        frame_count = 0
         while True:
             ret, frame = cap.read()
             if not ret:
@@ -165,6 +164,10 @@ async def process_video_swap(source_face, target_video_path: str) -> str | None:
                 frame = swapper.get(frame, target_faces[0], source_face, paste_back=True)
             
             out.write(frame)
+            frame_count += 1
+            if frame_count % 50 == 0:
+                progress_percent = int((frame_count / total_frames) * 100)
+                await bot.edit_message_text(chat_id=chat_id, message_id=progress_message.message_id, text=f"Processing video face swap... {progress_percent}% complete.")
     except Exception as e:
         logger.error(f"Error during frame processing: {e}")
         return None
@@ -210,7 +213,6 @@ def main() -> None:
     application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("swipFace", swip_face_command))
     application.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, handle_media))
 
     application.run_polling(drop_pending_updates=True)
